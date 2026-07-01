@@ -18,10 +18,10 @@
         "https://code.visualstudio.com/updates/v1_124",
         "https://code.visualstudio.com/updates/v1_125",
         "https://code.visualstudio.com/updates/v1_126",
-        "https://code.visualstudio.com/updates/v1_127"
+        "https://code.visualstudio.com/updates/v1_127",
+        "https://code.visualstudio.com/updates/v1_128"
     ],
     "Claude Code": [
-        "tag:github.com,2008:Repository/937253475/v2.1.136",
         "tag:github.com,2008:Repository/937253475/v2.1.137",
         "tag:github.com,2008:Repository/937253475/v2.1.138",
         "tag:github.com,2008:Repository/937253475/v2.1.139",
@@ -70,6 +70,7 @@
         "tag:github.com,2008:Repository/937253475/v2.1.191",
         "tag:github.com,2008:Repository/937253475/v2.1.193",
         "tag:github.com,2008:Repository/937253475/v2.1.195",
-        "tag:github.com,2008:Repository/937253475/v2.1.196"
+        "tag:github.com,2008:Repository/937253475/v2.1.196",
+        "tag:github.com,2008:Repository/937253475/v2.1.197"
     ]
 }
