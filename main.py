@@ -305,7 +305,8 @@ def main():
                 title = entry.get("title", "")
                 if "insiders" in title.lower():
                     logging.info(f"{source_name}: Skipped Insiders entry: {title}")
-                    skipped_guids.append(guid)
+                    if source_type != "vscode_github":
+                        skipped_guids.append(guid)
                     continue
 
                 if source_type == "vscode_github":
@@ -323,7 +324,6 @@ def main():
                         logging.info(
                             f"{source_name}: Skipped Insiders entry (Markdown Check): {title}"
                         )
-                        skipped_guids.append(guid)
                         continue
                     current_source_updates.append(
                         {
