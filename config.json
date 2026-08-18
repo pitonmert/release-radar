@@ -1,0 +1,10 @@
+{
+  "VS Code": {
+    "rss": "https://code.visualstudio.com/feed.xml",
+    "type": "vscode_github"
+  },
+  "Claude Code": {
+    "rss": "https://github.com/anthropics/claude-code/releases.atom",
+    "type": "github_releases"
+  }
+}

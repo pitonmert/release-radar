@@ -1,0 +1,25 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime files
+*.log
+*.tmp
+
+# App runtime data (SQLite, migrated from git-committed state.json)
+state.json
+data/
+
+# OS files
+.DS_Store
