@@ -5,6 +5,7 @@ import pytest
 
 import db
 import main
+from telegram_messages import ReleaseSummary
 
 
 class FakeFeed:
@@ -30,7 +31,7 @@ def _setup(monkeypatch, tmp_path, feed_entries, telegram_result=True, source_typ
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test.db"))
 
     monkeypatch.setattr(main, "fetch_feed_with_retry", lambda url, name: FakeFeed(feed_entries))
-    monkeypatch.setattr(main, "process_ai", lambda text: "AI summary")
+    monkeypatch.setattr(main, "process_ai", lambda text: ReleaseSummary("AI summary"))
 
     telegram_calls = []
 
@@ -157,13 +158,15 @@ def test_rss_extracts_full_content_or_description(monkeypatch, tmp_path, body, e
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
     main.run_scan_cycle()
 
     assert inputs == [f"Title: Announcement\n\n{expected}"]
     assert len(telegram_calls) == 1
-    assert "Source: https://example.com/announcement" in telegram_calls[0]
+    assert telegram_calls[0][0].reply_markup["inline_keyboard"][0][0]["url"] == (
+        "https://example.com/announcement"
+    )
 
 
 @pytest.mark.parametrize("content_type", ["text/plain", "text/markdown"])
@@ -173,7 +176,7 @@ def test_rss_preserves_plain_text_and_markdown(monkeypatch, tmp_path, content_ty
     _setup(monkeypatch, tmp_path, [entry], source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
     main.run_scan_cycle()
 
@@ -195,7 +198,7 @@ def test_rss_orders_by_date_or_reverse_feed_order(monkeypatch, tmp_path, missing
     _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
     main.run_scan_cycle()
 
@@ -238,7 +241,7 @@ def test_github_still_skips_insiders(monkeypatch, tmp_path):
 def test_rss_retries_failed_summary(monkeypatch, tmp_path):
     telegram_calls = _setup(monkeypatch, tmp_path, [_entry("new-1")], source_type="rss")
     _seed_history(tmp_path)
-    summaries = iter([None, "Summary"])
+    summaries = iter([None, ReleaseSummary("Summary")])
     monkeypatch.setattr(main, "process_ai", lambda text: next(summaries))
 
     main.run_scan_cycle()
@@ -268,10 +271,62 @@ def test_rss_limits_content_after_html_cleanup(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path, [entry], source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
     main.run_scan_cycle()
 
     assert inputs == [
         "Title: Test Release\n\n" + "x" * main.MAX_INPUT_CHARS + "\n\n[...text truncated...]"
     ]
+
+
+def test_vscode_uses_markdown_for_summary_and_public_page_for_button(monkeypatch, tmp_path):
+    entry = _entry("new-1", title="September 2026")
+    entry["link"] = "https://code.visualstudio.com/updates/v1_138"
+    entry["published_parsed"] = (2026, 9, 19, 0, 0, 0, 0, 0, 0)
+    calls = _setup(monkeypatch, tmp_path, [entry], source_type="vscode_github")
+    _seed_history(tmp_path)
+    fetched = []
+    inputs = []
+
+    def fetch(link):
+        fetched.append(link)
+        return "# Full markdown notes", "https://raw.githubusercontent.com/test/v1_138.md"
+
+    monkeypatch.setattr(main, "fetch_vscode_markdown", fetch)
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Özet"))
+    main.run_scan_cycle()
+
+    assert fetched == [entry["link"]]
+    assert inputs == ["Title: September 2026\n\n# Full markdown notes"]
+    assert calls[0][0].reply_markup["inline_keyboard"][0][0]["url"] == entry["link"]
+    assert "19.09.2026" in calls[0][0].text
+    assert "new-1" in _seen_guids(tmp_path)
+
+
+def test_partial_delivery_keeps_entry_unseen(monkeypatch, tmp_path):
+    sender = main.send_telegram_message
+    _setup(monkeypatch, tmp_path, [_entry("new-1")], source_type="rss")
+    _seed_history(tmp_path)
+    monkeypatch.setattr(main, "process_ai", lambda text: ReleaseSummary("x" * 12000))
+    # Restore the real multi-part sender while keeping every network call mocked.
+    monkeypatch.setattr(main, "send_telegram_message", sender)
+    outcomes = iter([True, False])
+    sent = []
+    monkeypatch.setattr(
+        main, "_send_single_telegram", lambda message: sent.append(message) or next(outcomes)
+    )
+    monkeypatch.setattr(main.time, "sleep", lambda _: None)
+    main.run_scan_cycle()
+    assert len(sent) == 2
+    assert "new-1" not in _seen_guids(tmp_path)
+
+
+def test_render_failure_does_not_block_other_entries(monkeypatch, tmp_path):
+    entries = [_entry("new-1", title="x" * 4096), _entry("new-2")]
+    calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
+    _seed_history(tmp_path)
+    main.run_scan_cycle()
+    assert len(calls) == 1
+    assert "new-1" not in _seen_guids(tmp_path)
+    assert "new-2" in _seen_guids(tmp_path)

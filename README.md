@@ -8,7 +8,8 @@ release-radar monitors software release feeds, summarizes new releases with Gemi
 - Supports VS Code release notes via GitHub markdown and standard GitHub Atom feeds
 - Tracks the entire ChatGPT & Codex changelog, including CLI, desktop, mobile/Remote, and general announcements
 - Summarizes release notes with Gemini (output in Turkish)
-- Sends summaries to Telegram with chunking support for long messages
+- Sends formatted Telegram summaries with expandable details, code blocks, and release-note buttons
+- Splits long summaries into numbered messages while preserving text and valid HTML
 - Runs continuously in Docker, scanning on a fixed interval (default: every 6 hours)
 - Stores processed entry IDs in a local SQLite database (`data/release_radar.db`) to avoid duplicate notifications
 - Retries failed network requests and API calls with exponential backoff
@@ -96,6 +97,40 @@ pytest                      # run the test suite
 ruff check .                # lint
 ```
 
+### Telegram message format
+
+Each release or announcement is sent with a bold source name and the original feed title.
+The publication date appears only when provided and parseable; an update date is not presented
+as a publication date. Releases without version numbers keep their announcement title.
+
+Gemini returns a validated JSON summary: a short overview, critical items, new features,
+important fixes, other changes, and optional source code examples. The overview and critical
+items remain visible. Other sections use Telegram's expandable quotations, and empty sections
+are omitted. Code examples must match the supplied source text and retain their indentation
+and line breaks. Malformed summaries are not sent or marked as processed; they are retried
+on the next scan.
+
+The application creates and escapes Telegram HTML itself. Messages include a
+“Resmî sürüm notlarını aç” URL button; VS Code links open its public release page while
+the summary still uses the GitHub Markdown content. Missing or invalid HTTP(S) links result
+in no button, rather than an invented destination. Link previews are disabled.
+
+Long summaries are split at section/item boundaries where possible, with numbered parts and
+repeated source/title headers. Oversized individual lines and code blocks are split without
+discarding text. Every part has independently valid HTML and fits the 4096-character limit,
+including expandable content and headers; emoji are counted conservatively using UTF-16 units.
+This preserves the generated summary, not the full upstream notes: the existing 15,000-character
+input limit and summarization still apply. A header too long to leave room for content causes
+the entry to be skipped without marking it processed.
+
+All parts must be delivered successfully before an entry is marked processed. If a later part
+fails, earlier parts may be sent again on the next scan; delivery is not exactly-once.
+Expanding quotations and opening URL buttons require no callback listener or webhook.
+
+Tests use fake Gemini/Telegram responses and temporary databases. A Docker build alone does
+not start the scanner. Deploying these code changes requires rebuilding the image; starting
+the rebuilt service performs the usual immediate scan.
+
 ## Automation
 
 release-radar is a long-running service, not a scheduled job — it manages its own internal scan loop (see `SCAN_INTERVAL_SECONDS` above). GitHub Actions is used only for CI (linting, tests, and a Docker build check on every push/PR) and no longer runs the scanner or commits any state back to the repository.
@@ -120,6 +155,6 @@ Skipping this step will not cause duplicate Telegram notifications (release-rada
 
 ## Notes
 
-The Gemini prompt requests summaries in Turkish. Announcements without a version number use their title instead. Static logs and Telegram message labels are in English.
+Summaries and Telegram message labels are in Turkish; logs remain in English.
 
 The ChatGPT & Codex feed covers published changelog announcements, not every desktop build. Separate Marketplace and OpenAI product-release feeds are not configured.
