@@ -97,6 +97,33 @@ pytest                      # run the test suite
 ruff check .                # lint
 ```
 
+### Manually test the latest Claude Code release
+
+From the repository root, with dependencies installed and `.env` configured:
+
+```bash
+.venv/bin/python scripts/test_latest_release.py
+```
+
+This sends a **real notification** to the configured Telegram chat and uses Gemini quota.
+It fetches only Claude Code, freezes the feed, and selects the newest eligible entry by
+publication time (update time as fallback). If dates are incomplete, it uses the first
+eligible entry in GitHub's newest-first feed and logs a warning. Insiders entries are excluded.
+
+The first scan silently records the feed in a temporary SQLite database. The script removes
+the selected entry, then runs the normal summary/delivery pipeline for that entry alone.
+Other sources and announcements arriving during the test are not processed. A long summary
+may produce several Telegram messages. Running the script again sends the release again.
+
+The temporary database is removed on success, failure, or Ctrl+C. Exit status is 0 on success,
+1 on failure, or 130 on Ctrl+C; there is no recurring scan or next-cycle retry. Forced process
+termination or a machine crash can leave temporary files behind. The normal local database,
+`DB_PATH` setting, legacy `state.json`, and server data are not changed. No server sync is needed.
+
+The script and its automated tests belong in the repository, but are not copied into the
+production Docker image or run by the service. Automated tests mock external services and
+never send real messages.
+
 ### Telegram message format
 
 Each release or announcement is sent with a bold source name and the original feed title.

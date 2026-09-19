@@ -210,15 +210,19 @@ def entry_publication_date(entry):
         return None
 
 
-def run_scan_cycle():
+def run_scan_cycle(*, config=None, db_path=None, feed_loader=None, initialize_empty=True):
+    """Scan once; explicit inputs also support isolated, deterministic replay tests."""
     logging.info("release-radar scan process started.")
 
-    config = load_json_file(CONFIG_FILE, {})
+    if config is None:
+        config = load_json_file(CONFIG_FILE, {})
+    if feed_loader is None:
+        feed_loader = fetch_feed_with_retry
     if not config:
         logging.error("config.json is empty or unreadable; skipping this scan cycle.")
         return
 
-    conn = db.get_connection()
+    conn = db.get_connection(db_path=db_path)
     try:
         for source_name, source_config in config.items():
             rss_url = source_config.get("rss")
@@ -229,14 +233,14 @@ def run_scan_cycle():
                 continue
 
             try:
-                feed = fetch_feed_with_retry(rss_url, source_name)
+                feed = feed_loader(rss_url, source_name)
                 if not feed or not feed.entries:
                     logging.warning(f"{source_name}: Feed empty or unreachable, skipping.")
                     continue
 
                 seen_guids = db.get_seen_guids(conn, source_name)
 
-                if not seen_guids:
+                if not seen_guids and initialize_empty:
                     logging.info(f"Initial setup for {source_name}, syncing data...")
                     initial_guids = []
                     for entry in feed.entries:
