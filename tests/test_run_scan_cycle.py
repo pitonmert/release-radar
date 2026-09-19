@@ -1,5 +1,8 @@
 import json
 
+import feedparser
+import pytest
+
 import db
 import main
 
@@ -18,10 +21,10 @@ def _entry(guid, title="Test Release", content="<p>Details</p>"):
     }
 
 
-def _setup(monkeypatch, tmp_path, feed_entries, telegram_result=True):
+def _setup(monkeypatch, tmp_path, feed_entries, telegram_result=True, source_type="github_releases"):
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps({"TestSource": {"rss": "http://example.com/feed", "type": "github_releases"}})
+        json.dumps({"TestSource": {"rss": "http://example.com/feed", "type": source_type}})
     )
     monkeypatch.setattr(main, "CONFIG_FILE", str(config_path))
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test.db"))
@@ -46,23 +49,26 @@ def _seen_guids(tmp_path, source="TestSource"):
     return guids
 
 
-def test_first_run_backfills_without_notifying(monkeypatch, tmp_path):
-    entries = [_entry("guid-1"), _entry("guid-2"), _entry("guid-3")]
-    telegram_calls = _setup(monkeypatch, tmp_path, entries)
+@pytest.mark.parametrize("source_type", ["github_releases", "rss"])
+def test_first_run_backfills_without_notifying(monkeypatch, tmp_path, source_type):
+    entries = [_entry(f"guid-{i}") for i in range(130)]
+    telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
+    main.run_scan_cycle()
     main.run_scan_cycle()
 
     assert telegram_calls == []
-    assert _seen_guids(tmp_path) == {"guid-1", "guid-2", "guid-3"}
+    assert _seen_guids(tmp_path) == {f"guid-{i}" for i in range(130)}
 
 
-def test_new_entry_recorded_only_on_telegram_success(monkeypatch, tmp_path):
+@pytest.mark.parametrize("source_type", ["github_releases", "rss"])
+def test_new_entry_recorded_only_on_telegram_success(monkeypatch, tmp_path, source_type):
     conn = db.get_connection(db_path=str(tmp_path / "test.db"))
     db.mark_seen(conn, "TestSource", ["old-1"])
     conn.close()
 
     entries = [_entry("old-1"), _entry("new-1")]
-    telegram_calls = _setup(monkeypatch, tmp_path, entries, telegram_result=True)
+    telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
     main.run_scan_cycle()
 
@@ -70,32 +76,202 @@ def test_new_entry_recorded_only_on_telegram_success(monkeypatch, tmp_path):
     assert "new-1" in _seen_guids(tmp_path)
 
 
-def test_new_entry_not_recorded_when_telegram_fails(monkeypatch, tmp_path):
+@pytest.mark.parametrize("source_type", ["github_releases", "rss"])
+def test_new_entry_not_recorded_when_telegram_fails(monkeypatch, tmp_path, source_type):
     conn = db.get_connection(db_path=str(tmp_path / "test.db"))
     db.mark_seen(conn, "TestSource", ["old-1"])
     conn.close()
 
     entries = [_entry("old-1"), _entry("new-1")]
-    telegram_calls = _setup(monkeypatch, tmp_path, entries, telegram_result=False)
+    telegram_calls = _setup(
+        monkeypatch, tmp_path, entries, telegram_result=False, source_type=source_type
+    )
 
     main.run_scan_cycle()
 
     assert len(telegram_calls) == 1
     assert "new-1" not in _seen_guids(tmp_path)
 
+    monkeypatch.setattr(main, "send_telegram_message", lambda message: True)
+    main.run_scan_cycle()
+    assert "new-1" in _seen_guids(tmp_path)
 
-def test_second_cycle_does_not_renotify_same_entry(monkeypatch, tmp_path):
+
+@pytest.mark.parametrize("source_type", ["github_releases", "rss"])
+def test_second_cycle_does_not_renotify_same_entry(monkeypatch, tmp_path, source_type):
     conn = db.get_connection(db_path=str(tmp_path / "test.db"))
     db.mark_seen(conn, "TestSource", ["old-1"])
     conn.close()
 
     entries = [_entry("old-1"), _entry("new-1")]
-    telegram_calls = _setup(monkeypatch, tmp_path, entries, telegram_result=True)
+    telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
     main.run_scan_cycle()
     assert len(telegram_calls) == 1
 
     telegram_calls.clear()
+    entries[1]["content"] = [{"value": "Updated release notes"}]
     main.run_scan_cycle()
 
     assert telegram_calls == []
+
+
+def _seed_history(tmp_path):
+    conn = db.get_connection(db_path=str(tmp_path / "test.db"))
+    db.mark_seen(conn, "TestSource", ["old-1"])
+    conn.close()
+
+
+def _rss_entries(body):
+    return feedparser.parse(
+        '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+        f"<channel><title>Test feed</title>{body}</channel></rss>"
+    ).entries
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            "<description>Short summary</description>"
+            "<content:encoded><![CDATA[<h2>Changes</h2><p>Full details</p>]]></content:encoded>",
+            "Changes\nFull details",
+        ),
+        (
+            "<description>Short summary</description>"
+            "<content:encoded><![CDATA[# Announcement\n\nUse `codex app`.]]></content:encoded>",
+            "# Announcement\n\nUse `codex app`.",
+        ),
+        ("<description><![CDATA[<p>Description only</p>]]></description>", "Description only"),
+        (
+            "<content:encoded></content:encoded><description>Fallback</description>",
+            "Fallback",
+        ),
+    ],
+)
+def test_rss_extracts_full_content_or_description(monkeypatch, tmp_path, body, expected):
+    entries = _rss_entries(
+        "<item><guid>new-1</guid><title>Announcement</title>"
+        f"<link>https://example.com/announcement</link>{body}</item>"
+    )
+    telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
+    _seed_history(tmp_path)
+    inputs = []
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+
+    main.run_scan_cycle()
+
+    assert inputs == [f"Title: Announcement\n\n{expected}"]
+    assert len(telegram_calls) == 1
+    assert "Source: https://example.com/announcement" in telegram_calls[0]
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "text/markdown"])
+def test_rss_preserves_plain_text_and_markdown(monkeypatch, tmp_path, content_type):
+    entry = _entry("new-1", content="Use `codex <prompt>` and List<T>.")
+    entry["content"][0]["type"] = content_type
+    _setup(monkeypatch, tmp_path, [entry], source_type="rss")
+    _seed_history(tmp_path)
+    inputs = []
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+
+    main.run_scan_cycle()
+
+    assert "Use `codex <prompt>` and List<T>." in inputs[0]
+
+
+@pytest.mark.parametrize("missing_date", [False, True])
+def test_rss_orders_by_date_or_reverse_feed_order(monkeypatch, tmp_path, missing_date):
+    items = []
+    for day in (18, 16, 17):
+        date = f"<pubDate>{day} Sep 2026 00:00:00 GMT</pubDate>"
+        if missing_date and day == 16:
+            date = ""
+        items.append(
+            f"<item><guid>day-{day}</guid><title>Day {day}</title>"
+            f"{date}<description>Details</description></item>"
+        )
+    entries = _rss_entries("".join(items))
+    _setup(monkeypatch, tmp_path, entries, source_type="rss")
+    _seed_history(tmp_path)
+    inputs = []
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+
+    main.run_scan_cycle()
+
+    expected_days = [17, 16, 18] if missing_date else [16, 17, 18]
+    assert [text.splitlines()[0] for text in inputs] == [
+        f"Title: Day {day}" for day in expected_days
+    ]
+
+
+def test_rss_does_not_filter_titles_or_categories(monkeypatch, tmp_path):
+    entries = _rss_entries("".join(
+        f"<item><guid>{category}</guid><title>{title}</title>"
+        f"<category>{category}</category><description>Details</description></item>"
+        for category, title in (
+            ("general", "Insiders announcement"),
+            ("codex-app", "App beta"),
+            ("codex-mobile", "Mobile alpha"),
+            ("codex-cli", "CLI release candidate rc.1"),
+        )
+    ))
+    telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
+    _seed_history(tmp_path)
+
+    main.run_scan_cycle()
+
+    assert len(telegram_calls) == 4
+
+
+def test_github_still_skips_insiders(monkeypatch, tmp_path):
+    entries = [_entry("new-1", title="Insiders release")]
+    telegram_calls = _setup(monkeypatch, tmp_path, entries)
+    _seed_history(tmp_path)
+
+    main.run_scan_cycle()
+
+    assert telegram_calls == []
+    assert "new-1" in _seen_guids(tmp_path)
+
+
+def test_rss_retries_failed_summary(monkeypatch, tmp_path):
+    telegram_calls = _setup(monkeypatch, tmp_path, [_entry("new-1")], source_type="rss")
+    _seed_history(tmp_path)
+    summaries = iter([None, "Summary"])
+    monkeypatch.setattr(main, "process_ai", lambda text: next(summaries))
+
+    main.run_scan_cycle()
+    assert telegram_calls == []
+    assert "new-1" not in _seen_guids(tmp_path)
+
+    main.run_scan_cycle()
+    assert len(telegram_calls) == 1
+    assert "new-1" in _seen_guids(tmp_path)
+
+
+@pytest.mark.parametrize("content", ["", "<p> </p>"])
+def test_rss_empty_content_is_not_marked_seen(monkeypatch, tmp_path, content):
+    telegram_calls = _setup(
+        monkeypatch, tmp_path, [_entry("new-1", content=content)], source_type="rss"
+    )
+    _seed_history(tmp_path)
+
+    main.run_scan_cycle()
+
+    assert telegram_calls == []
+    assert "new-1" not in _seen_guids(tmp_path)
+
+
+def test_rss_limits_content_after_html_cleanup(monkeypatch, tmp_path):
+    entry = _entry("new-1", content="<p>" + "x" * (main.MAX_INPUT_CHARS + 10) + "</p>")
+    _setup(monkeypatch, tmp_path, [entry], source_type="rss")
+    _seed_history(tmp_path)
+    inputs = []
+    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or "Summary")
+
+    main.run_scan_cycle()
+
+    assert inputs == [
+        "Title: Test Release\n\n" + "x" * main.MAX_INPUT_CHARS + "\n\n[...text truncated...]"
+    ]

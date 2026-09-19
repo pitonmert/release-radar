@@ -6,6 +6,7 @@ release-radar monitors software release feeds, summarizes new releases with Gemi
 
 - Fetches release updates from configured RSS/Atom sources
 - Supports VS Code release notes via GitHub markdown and standard GitHub Atom feeds
+- Tracks the entire ChatGPT & Codex changelog, including CLI, desktop, mobile/Remote, and general announcements
 - Summarizes release notes with Gemini (output in Turkish)
 - Sends summaries to Telegram with chunking support for long messages
 - Runs continuously in Docker, scanning on a fixed interval (default: every 6 hours)
@@ -46,6 +47,10 @@ Configure sources in `config.json`:
   "Claude Code": {
     "rss": "https://github.com/anthropics/claude-code/releases.atom",
     "type": "github_releases"
+  },
+  "ChatGPT & Codex": {
+    "rss": "https://learn.chatgpt.com/docs/changelog/rss.xml",
+    "type": "rss"
   }
 }
 ```
@@ -54,8 +59,11 @@ Supported source types:
 
 - `vscode_github` — fetches full release notes from the VS Code docs GitHub repository
 - `github_releases` — works with any GitHub repository's Atom feed (`/releases.atom`)
+- `rss` — reads full feed content (`content:encoded` when present), falling back to the summary/description. HTML is converted to text; Markdown text is accepted. No category, Insiders, or prerelease filters are applied. Entries are processed oldest first using publication dates (update dates as a fallback); if any date is missing, reverse feed order is used instead.
 
 `config.json` is bind-mounted read-only into the container, so you can edit the source list without rebuilding — changes take effect on the next scan cycle (or immediately after `docker compose restart`).
+
+Upgrading from a version without `rss` support requires rebuilding the image with `docker compose up -d --build`; changing only the configuration is not enough. The existing database is preserved.
 
 ### Optional environment variables
 
@@ -70,7 +78,7 @@ docker compose up -d --build
 
 This runs an immediate scan on startup, then rescans every `SCAN_INTERVAL_SECONDS` (6 hours by default) until stopped. `restart: unless-stopped` means the service survives Docker Desktop or host restarts.
 
-On the first run for a given source, release-radar syncs existing entries into the SQLite database without sending notifications. Subsequent runs process only new entries.
+On the first run for a given source, release-radar syncs all existing entries with valid IDs into the SQLite database without sending notifications, including feeds with more than 50 entries. Subsequent runs process only unseen entries. An entry is marked seen after successful Telegram delivery; failed summaries or deliveries are retried on a later scan. Edits to an already-seen entry with the same ID do not trigger another notification.
 
 Useful commands:
 
@@ -112,4 +120,6 @@ Skipping this step will not cause duplicate Telegram notifications (release-rada
 
 ## Notes
 
-The Gemini prompt requests summaries in Turkish. Static logs and Telegram message labels are in English.
+The Gemini prompt requests summaries in Turkish. Announcements without a version number use their title instead. Static logs and Telegram message labels are in English.
+
+The ChatGPT & Codex feed covers published changelog announcements, not every desktop build. Separate Marketplace and OpenAI product-release feeds are not configured.

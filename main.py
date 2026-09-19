@@ -120,10 +120,11 @@ def fetch_vscode_markdown(entry_link):
 def process_ai(text_to_summarize):
     try:
         prompt = (
-            "Aşağıdaki yazılım sürüm notlarını Türkçeye çevir ve özetle. "
+            "Aşağıdaki yazılım sürüm notlarını veya duyuruyu Türkçeye çevir ve özetle. "
             "Teknik terimleri, komut adlarını ve kod ifadelerini değiştirme. "
             "Markdown karakteri (*, `, #) kullanma, sadece düz metin kullan. "
-            "İlk satıra sürüm adını/numarasını yaz (Örn: Sürüm: v2.1.146).\n\n"
+            "İlk satıra varsa sürüm adını/numarasını yaz (Örn: Sürüm: v2.1.146). "
+            "Sürüm numarası olmayan duyurularda duyuru başlığını kullan; sürüm numarası uydurma.\n\n"
             "Çıktıyı şu üç bölümde düzenle:\n"
             "1. Yeni Özellikler: Tüm yeni özellikleri kısa ve öz şekilde listele. Her maddeyi '- ' ile başlat.\n"
             "2. Kritik Hata Düzeltmeleri: Yalnızca kritik veya önemli hata düzeltmelerini özetle. Her maddeyi '- ' ile başlat.\n"
@@ -232,7 +233,7 @@ def run_scan_cycle():
                 if not seen_guids:
                     logging.info(f"Initial setup for {source_name}, syncing data...")
                     initial_guids = []
-                    for entry in feed.entries[:50]:
+                    for entry in feed.entries:
                         guid = entry.get("id") or entry.get("guid") or entry.get("link")
                         if not guid:
                             continue
@@ -246,7 +247,14 @@ def run_scan_cycle():
                 current_source_updates = []
                 skipped_guids = []
 
-                for entry in feed.entries:
+                entries = feed.entries
+                if source_type == "rss":
+                    entries = list(reversed(entries))
+                    # Sort dated feeds chronologically; otherwise retain reverse feed order.
+                    if all(e.get("published_parsed") or e.get("updated_parsed") for e in entries):
+                        entries.sort(key=lambda e: e.get("published_parsed") or e["updated_parsed"])
+
+                for entry in entries:
                     guid = entry.get("id") or entry.get("guid") or entry.get("link")
                     if not guid:
                         logging.warning(
@@ -263,7 +271,7 @@ def run_scan_cycle():
                         continue
 
                     title = entry.get("title", "")
-                    if "insiders" in title.lower():
+                    if source_type != "rss" and "insiders" in title.lower():
                         logging.info(f"{source_name}: Skipped Insiders entry: {title}")
                         if source_type != "vscode_github":
                             skipped_guids.append(guid)
@@ -294,7 +302,7 @@ def run_scan_cycle():
                             }
                         )
 
-                    elif source_type == "github_releases":
+                    elif source_type in ("github_releases", "rss"):
                         contents = entry.get("content") or [{}]
                         raw_content = contents[0].get("value") or entry.get("summary") or ""
                         if not raw_content:
@@ -303,11 +311,23 @@ def run_scan_cycle():
                             )
                             continue
 
-                        content = (
-                            BeautifulSoup(raw_content, "html.parser")
-                            .get_text(separator="\n")
-                            .strip()
+                        content_type = (
+                            contents[0].get("type")
+                            if contents[0].get("value")
+                            else entry.get("summary_detail", {}).get("type")
                         )
+                        if source_type == "rss" and content_type in ("text/plain", "text/markdown"):
+                            content = raw_content.strip()
+                        else:
+                            content = (
+                                BeautifulSoup(raw_content, "html.parser")
+                                .get_text(separator="\n")
+                                .strip()
+                            )
+
+                        if not content:
+                            logging.warning(f"{source_name} - '{title}': Content is empty, skipping.")
+                            continue
 
                         if len(content) > MAX_INPUT_CHARS:
                             content = (
