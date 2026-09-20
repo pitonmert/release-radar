@@ -1,4 +1,4 @@
-import db
+from release_radar import database as db
 
 
 def _connect(tmp_path):

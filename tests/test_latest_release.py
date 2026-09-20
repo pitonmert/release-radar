@@ -1,13 +1,14 @@
 from contextlib import closing
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import db
-import main as app
+from release_radar import database as db
+from release_radar import config as settings, feeds, summarizer as summaries, telegram, service
 from scripts import test_latest_release as replay
-from telegram_messages import ReleaseSummary
+from release_radar.messages import ReleaseSummary
 
 
 def entry(guid, day=1, title=None):
@@ -30,11 +31,11 @@ def harness(monkeypatch, tmp_path):
         replay.SOURCE: {"rss": "https://example.com/feed", "type": "github_releases"},
         "Other": {"rss": "https://example.com/other", "type": "rss"},
     }
-    monkeypatch.setattr(app, "load_config", lambda: None)
-    monkeypatch.setattr(app, "load_json_file", lambda *_: config)
+    monkeypatch.setattr(settings, "load_config", lambda: None)
+    monkeypatch.setattr(settings, "load_json_file", lambda *_: config)
     state = SimpleNamespace(
         entries=[entry("older", 1), entry("newest", 19), entry("middle", 10)],
-        fetches=[], summaries=[], messages=[], scans=[],
+        fetches=[], summaries=[], messages=[], scans=[], models=[],
         summary_result=ReleaseSummary("Özet"), delivery_result=True,
     )
 
@@ -42,15 +43,16 @@ def harness(monkeypatch, tmp_path):
         state.fetches.append((url, source))
         return SimpleNamespace(entries=state.entries)
 
-    def summarize(text):
+    def summarize(text, *, model):
         state.summaries.append(text)
+        state.models.append(model)
         return state.summary_result
 
     def send(messages):
         state.messages.append(messages)
         return state.delivery_result
 
-    scan = app.run_scan_cycle
+    scan = service.run_scan_cycle
 
     def record_scan(**kwargs):
         state.scans.append(kwargs)
@@ -61,10 +63,10 @@ def harness(monkeypatch, tmp_path):
             # A later arrival must never be included in the second pass.
             state.entries.append(entry("arrived-during-test", 20))
 
-    monkeypatch.setattr(app, "fetch_feed_with_retry", fetch)
-    monkeypatch.setattr(app, "process_ai", summarize)
-    monkeypatch.setattr(app, "send_telegram_message", send)
-    monkeypatch.setattr(app, "run_scan_cycle", record_scan)
+    monkeypatch.setattr(feeds, "fetch_feed_with_retry", fetch)
+    monkeypatch.setattr(summaries, "process_ai", summarize)
+    monkeypatch.setattr(telegram, "send_telegram_message", send)
+    monkeypatch.setattr(service, "run_scan_cycle", record_scan)
     yield state
     assert production_db.read_bytes() == original
     for kwargs in state.scans:
@@ -83,6 +85,21 @@ def test_replays_only_latest_and_cleans_up(harness, single_entry):
     assert all(list(scan["config"]) == [replay.SOURCE] for scan in harness.scans)
     assert harness.summaries == ["Title: newest\n\nRelease details"]
     assert len(harness.messages) == 1
+    assert harness.models == ["gemini-3.5-flash-lite"]
+
+
+def test_explicit_model_is_scoped_to_test(harness):
+    assert replay.main(["--model", "gemini-3.8-flash"]) == 0
+    assert harness.models == ["gemini-3.8-flash"]
+    assert settings.DEFAULT_MODEL == "gemini-3.5-flash-lite"
+
+
+@pytest.mark.parametrize("arguments", [["--model"], ["--model", "  "], ["--unknown"]])
+def test_invalid_arguments_do_not_fetch(harness, arguments):
+    with pytest.raises(SystemExit) as error:
+        replay.main(arguments)
+    assert error.value.code == 2
+    assert not harness.fetches
 
 
 @pytest.mark.parametrize("failure", ["summary", "delivery", "empty_content", "exception"])
@@ -94,28 +111,28 @@ def test_failure_returns_nonzero_and_cleans_up(harness, monkeypatch, failure):
     elif failure == "empty_content":
         harness.entries[1]["content"] = []
     else:
-        def explode(_):
+        def explode(_, **kwargs):
             raise RuntimeError("API unavailable")
-        monkeypatch.setattr(app, "process_ai", explode)
+        monkeypatch.setattr(summaries, "process_ai", explode)
     assert replay.main() == 1
     assert len(harness.scans) == 2
 
 
 def test_ctrl_c_cleans_up(harness, monkeypatch):
-    def interrupt(_):
+    def interrupt(_, **kwargs):
         raise KeyboardInterrupt
-    monkeypatch.setattr(app, "process_ai", interrupt)
+    monkeypatch.setattr(summaries, "process_ai", interrupt)
     assert replay.main() == 130
 
 
 def test_baseline_failure_does_not_send(harness, monkeypatch):
-    original = app.run_scan_cycle
+    original = service.run_scan_cycle
 
     def failed_baseline(**kwargs):
         kwargs["feed_loader"] = lambda *_: None
         original(**kwargs)
 
-    monkeypatch.setattr(app, "run_scan_cycle", failed_baseline)
+    monkeypatch.setattr(service, "run_scan_cycle", failed_baseline)
     assert replay.main() == 1
     assert not harness.summaries
     assert not harness.messages
@@ -129,7 +146,7 @@ def test_empty_feed_does_not_send(harness):
 
 
 def test_missing_source_does_not_fetch(harness, monkeypatch):
-    monkeypatch.setattr(app, "load_json_file", lambda *_: {})
+    monkeypatch.setattr(settings, "load_json_file", lambda *_: {})
     assert replay.main() == 1
     assert not harness.fetches
 
@@ -165,3 +182,72 @@ def test_missing_dates_use_first_eligible_feed_entry(caplog):
 def test_no_eligible_entry():
     with pytest.raises(ValueError, match="uygun sürüm"):
         replay.latest_entry([entry("insiders", title="Insiders")])
+
+
+def test_exact_version_selection(harness):
+    assert replay.main(["--version", "older"]) == 0
+    assert harness.summaries == ["Title: older\n\nRelease details"]
+
+
+def test_missing_version_does_not_send(harness):
+    assert replay.main(["--version", "missing"]) == 1
+    assert not harness.messages and not harness.scans
+
+
+def test_invalid_interactive_duration(harness):
+    with pytest.raises(SystemExit) as error:
+        replay.main(["--interactive", "--listen-seconds", "0"])
+    assert error.value.code == 2
+    assert not harness.fetches
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_interactive_script_shows_summary_directly_then_cleans_up(harness, monkeypatch, interrupt):
+    class Client:
+        chat_id = "123"
+
+        def __init__(self):
+            self.sent = []
+            self.edited = []
+
+        def preflight(self):
+            pass
+
+        def poll_lock(self):
+            return nullcontext()
+
+        def call(self, method, **kwargs):
+            assert method == "getUpdates"
+            return []
+
+        def send(self, text, keyboard):
+            self.sent.append((text, keyboard))
+            return 1
+
+        def edit(self, message_id, text, keyboard):
+            self.edited.append((message_id, text, keyboard))
+
+    client = Client()
+    monkeypatch.setattr(replay, "TelegramClient", lambda *_: client)
+    listened = []
+
+    def listen(menu, stop, seconds, not_before):
+        listened.append(seconds)
+        assert Path(menu.db_path).exists()
+        assert len(client.sent) == 1
+        assert "Özet" in client.sent[0][0]
+        assert "Yeni güncelleme hazır" not in client.sent[0][0]
+        assert len(harness.summaries) == 1
+        assert not hasattr(menu, "home")
+        if interrupt:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(replay.Pager, "listen", listen)
+    assert replay.main(["--version", "newest", "--interactive", "--listen-seconds", "7"]) == (
+        130 if interrupt else 0
+    )
+    assert listened == [7]
+    assert not harness.messages  # legacy multi-message sender was not used
+    assert "test sona erdi" in client.edited[0][1]
+    assert all("callback_data" not in button
+               for row in client.edited[0][2]["inline_keyboard"] for button in row)

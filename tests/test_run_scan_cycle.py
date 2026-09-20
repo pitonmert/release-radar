@@ -3,9 +3,9 @@ import json
 import feedparser
 import pytest
 
-import db
-import main
-from telegram_messages import ReleaseSummary
+from release_radar import database as db
+from release_radar import config as settings, feeds, summarizer as summaries, telegram, service
+from release_radar.messages import ReleaseSummary
 
 
 class FakeFeed:
@@ -27,11 +27,11 @@ def _setup(monkeypatch, tmp_path, feed_entries, telegram_result=True, source_typ
     config_path.write_text(
         json.dumps({"TestSource": {"rss": "http://example.com/feed", "type": source_type}})
     )
-    monkeypatch.setattr(main, "CONFIG_FILE", str(config_path))
+    monkeypatch.setattr(settings, "CONFIG_FILE", str(config_path))
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test.db"))
 
-    monkeypatch.setattr(main, "fetch_feed_with_retry", lambda url, name: FakeFeed(feed_entries))
-    monkeypatch.setattr(main, "process_ai", lambda text: ReleaseSummary("AI summary"))
+    monkeypatch.setattr(feeds, "fetch_feed_with_retry", lambda url, name: FakeFeed(feed_entries))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: ReleaseSummary("AI summary"))
 
     telegram_calls = []
 
@@ -39,7 +39,7 @@ def _setup(monkeypatch, tmp_path, feed_entries, telegram_result=True, source_typ
         telegram_calls.append(message)
         return telegram_result
 
-    monkeypatch.setattr(main, "send_telegram_message", fake_send_telegram)
+    monkeypatch.setattr(telegram, "send_telegram_message", fake_send_telegram)
     return telegram_calls
 
 
@@ -55,8 +55,8 @@ def test_first_run_backfills_without_notifying(monkeypatch, tmp_path, source_typ
     entries = [_entry(f"guid-{i}") for i in range(130)]
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
-    main.run_scan_cycle()
-    main.run_scan_cycle()
+    service.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert telegram_calls == []
     assert _seen_guids(tmp_path) == {f"guid-{i}" for i in range(130)}
@@ -71,7 +71,7 @@ def test_new_entry_recorded_only_on_telegram_success(monkeypatch, tmp_path, sour
     entries = [_entry("old-1"), _entry("new-1")]
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert len(telegram_calls) == 1
     assert "new-1" in _seen_guids(tmp_path)
@@ -88,13 +88,13 @@ def test_new_entry_not_recorded_when_telegram_fails(monkeypatch, tmp_path, sourc
         monkeypatch, tmp_path, entries, telegram_result=False, source_type=source_type
     )
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert len(telegram_calls) == 1
     assert "new-1" not in _seen_guids(tmp_path)
 
-    monkeypatch.setattr(main, "send_telegram_message", lambda message: True)
-    main.run_scan_cycle()
+    monkeypatch.setattr(telegram, "send_telegram_message", lambda message: True)
+    service.run_scan_cycle()
     assert "new-1" in _seen_guids(tmp_path)
 
 
@@ -107,12 +107,12 @@ def test_second_cycle_does_not_renotify_same_entry(monkeypatch, tmp_path, source
     entries = [_entry("old-1"), _entry("new-1")]
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type=source_type)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
     assert len(telegram_calls) == 1
 
     telegram_calls.clear()
     entries[1]["content"] = [{"value": "Updated release notes"}]
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert telegram_calls == []
 
@@ -158,9 +158,9 @@ def test_rss_extracts_full_content_or_description(monkeypatch, tmp_path, body, e
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert inputs == [f"Title: Announcement\n\n{expected}"]
     assert len(telegram_calls) == 1
@@ -176,9 +176,9 @@ def test_rss_preserves_plain_text_and_markdown(monkeypatch, tmp_path, content_ty
     _setup(monkeypatch, tmp_path, [entry], source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert "Use `codex <prompt>` and List<T>." in inputs[0]
 
@@ -198,9 +198,9 @@ def test_rss_orders_by_date_or_reverse_feed_order(monkeypatch, tmp_path, missing
     _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     expected_days = [17, 16, 18] if missing_date else [16, 17, 18]
     assert [text.splitlines()[0] for text in inputs] == [
@@ -222,7 +222,7 @@ def test_rss_does_not_filter_titles_or_categories(monkeypatch, tmp_path):
     telegram_calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert len(telegram_calls) == 4
 
@@ -232,7 +232,7 @@ def test_github_still_skips_insiders(monkeypatch, tmp_path):
     telegram_calls = _setup(monkeypatch, tmp_path, entries)
     _seed_history(tmp_path)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert telegram_calls == []
     assert "new-1" in _seen_guids(tmp_path)
@@ -241,14 +241,14 @@ def test_github_still_skips_insiders(monkeypatch, tmp_path):
 def test_rss_retries_failed_summary(monkeypatch, tmp_path):
     telegram_calls = _setup(monkeypatch, tmp_path, [_entry("new-1")], source_type="rss")
     _seed_history(tmp_path)
-    summaries = iter([None, ReleaseSummary("Summary")])
-    monkeypatch.setattr(main, "process_ai", lambda text: next(summaries))
+    outcomes = iter([None, ReleaseSummary("Summary")])
+    monkeypatch.setattr(summaries, "process_ai", lambda text: next(outcomes))
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
     assert telegram_calls == []
     assert "new-1" not in _seen_guids(tmp_path)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
     assert len(telegram_calls) == 1
     assert "new-1" in _seen_guids(tmp_path)
 
@@ -260,23 +260,23 @@ def test_rss_empty_content_is_not_marked_seen(monkeypatch, tmp_path, content):
     )
     _seed_history(tmp_path)
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert telegram_calls == []
     assert "new-1" not in _seen_guids(tmp_path)
 
 
 def test_rss_limits_content_after_html_cleanup(monkeypatch, tmp_path):
-    entry = _entry("new-1", content="<p>" + "x" * (main.MAX_INPUT_CHARS + 10) + "</p>")
+    entry = _entry("new-1", content="<p>" + "x" * (feeds.MAX_INPUT_CHARS + 10) + "</p>")
     _setup(monkeypatch, tmp_path, [entry], source_type="rss")
     _seed_history(tmp_path)
     inputs = []
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Summary"))
 
-    main.run_scan_cycle()
+    service.run_scan_cycle()
 
     assert inputs == [
-        "Title: Test Release\n\n" + "x" * main.MAX_INPUT_CHARS + "\n\n[...text truncated...]"
+        "Title: Test Release\n\n" + "x" * feeds.MAX_INPUT_CHARS + "\n\n[...text truncated...]"
     ]
 
 
@@ -293,9 +293,9 @@ def test_vscode_uses_markdown_for_summary_and_public_page_for_button(monkeypatch
         fetched.append(link)
         return "# Full markdown notes", "https://raw.githubusercontent.com/test/v1_138.md"
 
-    monkeypatch.setattr(main, "fetch_vscode_markdown", fetch)
-    monkeypatch.setattr(main, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Özet"))
-    main.run_scan_cycle()
+    monkeypatch.setattr(feeds, "fetch_vscode_markdown", fetch)
+    monkeypatch.setattr(summaries, "process_ai", lambda text: inputs.append(text) or ReleaseSummary("Özet"))
+    service.run_scan_cycle()
 
     assert fetched == [entry["link"]]
     assert inputs == ["Title: September 2026\n\n# Full markdown notes"]
@@ -305,19 +305,19 @@ def test_vscode_uses_markdown_for_summary_and_public_page_for_button(monkeypatch
 
 
 def test_partial_delivery_keeps_entry_unseen(monkeypatch, tmp_path):
-    sender = main.send_telegram_message
+    sender = telegram.send_telegram_message
     _setup(monkeypatch, tmp_path, [_entry("new-1")], source_type="rss")
     _seed_history(tmp_path)
-    monkeypatch.setattr(main, "process_ai", lambda text: ReleaseSummary("x" * 12000))
+    monkeypatch.setattr(summaries, "process_ai", lambda text: ReleaseSummary("x" * 12000))
     # Restore the real multi-part sender while keeping every network call mocked.
-    monkeypatch.setattr(main, "send_telegram_message", sender)
+    monkeypatch.setattr(telegram, "send_telegram_message", sender)
     outcomes = iter([True, False])
     sent = []
     monkeypatch.setattr(
-        main, "_send_single_telegram", lambda message: sent.append(message) or next(outcomes)
+        telegram, "_send_single_telegram", lambda message: sent.append(message) or next(outcomes)
     )
-    monkeypatch.setattr(main.time, "sleep", lambda _: None)
-    main.run_scan_cycle()
+    monkeypatch.setattr(telegram.time, "sleep", lambda _: None)
+    service.run_scan_cycle()
     assert len(sent) == 2
     assert "new-1" not in _seen_guids(tmp_path)
 
@@ -326,7 +326,7 @@ def test_render_failure_does_not_block_other_entries(monkeypatch, tmp_path):
     entries = [_entry("new-1", title="x" * 4096), _entry("new-2")]
     calls = _setup(monkeypatch, tmp_path, entries, source_type="rss")
     _seed_history(tmp_path)
-    main.run_scan_cycle()
+    service.run_scan_cycle()
     assert len(calls) == 1
     assert "new-1" not in _seen_guids(tmp_path)
     assert "new-2" in _seen_guids(tmp_path)

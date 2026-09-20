@@ -7,6 +7,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv/
@@ -17,7 +19,7 @@ env/
 *.log
 *.tmp
 
-# App runtime data (SQLite, migrated from git-committed state.json)
+# App runtime data (including legacy state)
 state.json
 data/
 
